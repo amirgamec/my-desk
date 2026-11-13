@@ -88,7 +88,7 @@ CHARACTER_X = 0.5
 STAY_ON_DESKTOP = True
 BLUR_RADIUS = 28
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 # Raw link to version.json in your GitHub repo, e.g.
 # https://raw.githubusercontent.com/YOUR_NAME/glass-desktop/main/version.json
 UPDATE_URL = "https://raw.githubusercontent.com/amirgamec/my-desk/main/version.json"
@@ -116,25 +116,11 @@ CARD_IMAGES = [
 # Default pinned items (used the first time, or after "Reset").
 # "qta": qtawesome icon name   "exe": optional exe path (glob allowed) launched first
 SIDEBAR_DEFAULT = [
-    {"label": "Lms", "qta": "fa5s.school", "exe": None,
-     "target": "https://lms-narmak.karamooz.sch.ir/login/index.php"},
-    {"label": "YouTube", "qta": "fa5b.youtube", "exe": None,
-     "target": "https://www.youtube.com"},
-    {"label": "ChatGPT", "qta": "fa5s.robot", "exe": None,
-     "target": "https://chatgpt.com"},
+
 ]
 
 DOCK_DEFAULT = [
-    {"label": "Spotify", "qta": "fa5b.spotify", "target": "https://open.spotify.com",
-     "exe": r"%APPDATA%\Spotify\Spotify.exe"},
-    {"label": "This PC", "qta": "fa5s.desktop", "target": "shell:MyComputerFolder",
-     "exe": None},
-    {"label": "Chrome", "qta": "fa5b.chrome", "target": "https://google.com",
-     "exe": r"C:\Program Files*\Google\Chrome\Application\chrome.exe"},
-    {"label": "VS Code", "qta": "fa5s.code", "target": "code",
-     "exe": r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe"},
-    {"label": "Discord", "qta": "fa5b.discord", "target": "https://discord.com/app",
-     "exe": None},
+
 ]
 
 MENU_QSS = """
@@ -4863,7 +4849,7 @@ class MainWindow(QWidget):
             self.character.resize(scaled.size())
             self.char_base = QPoint(
                 int(self.width() * CHARACTER_X - scaled.width() / 2),
-                self.height() - scaled.height()
+                self.height() - scaled.height() + 10
             )
             self.character.move(self.char_base)
 
