@@ -88,7 +88,7 @@ CHARACTER_X = 0.5
 STAY_ON_DESKTOP = True
 BLUR_RADIUS = 28
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 # Raw link to version.json in your GitHub repo, e.g.
 # https://raw.githubusercontent.com/YOUR_NAME/glass-desktop/main/version.json
 UPDATE_URL = "https://raw.githubusercontent.com/amirgamec/my-desk/main/version.json"
