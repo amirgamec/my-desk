@@ -43,6 +43,11 @@ import ast
 import hashlib
 import secrets
 import urllib.request
+import urllib.error
+import base64
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import datetime
 import atexit
 import ctypes
 import subprocess
@@ -88,15 +93,30 @@ CHARACTER_X = 0.5
 STAY_ON_DESKTOP = True
 BLUR_RADIUS = 28
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.7"
 # Raw link to version.json in your GitHub repo, e.g.
 # https://raw.githubusercontent.com/YOUR_NAME/glass-desktop/main/version.json
-UPDATE_URL = "https://raw.githubusercontent.com/amirgamec/my-desk/main/version.json"
-# Default friends database (Firebase Realtime Database link). Leave empty to type it in the app.
-FIREBASE_URL = ""
+UPDATE_URL = "https://github.com/amirgamec/my-desk/releases/latest/download/version.json"
+UPDATE_FALLBACK_URL = "https://raw.githubusercontent.com/amirgamec/my-desk/main/version.json"
+# Built-in Supabase project settings. Publishable keys are intended for client apps.
+# Local port used to catch the Google sign-in answer (must be added in Supabase > URL Configuration).
+OAUTH_PORT = 54871
+SUPABASE_URL = "https://flbzurmglipzsmazwwir.supabase.co"
+SUPABASE_PUBLISHABLE_KEY = "sb_publishable_deLxqYQ3AbwOvfFYVjfArA_cIW2nT3v"
 
 FROZEN = bool(getattr(sys, "frozen", False))      # True when built into an .exe (PyInstaller)
-BASE = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+EXE_PATH = Path(sys.executable).resolve()
+if FROZEN and os.name == "nt":
+    # the .exe can live anywhere (Downloads...) and be replaced by updates: data goes to %APPDATA%
+    BASE = Path(os.environ.get("APPDATA") or Path.home()) / "GlassDesktop"
+    try:
+        BASE.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        BASE = EXE_PATH.parent
+elif FROZEN:
+    BASE = EXE_PATH.parent
+else:
+    BASE = Path(__file__).resolve().parent
 ASSETS = BASE / "assets"
 CONFIG_PATH = BASE / "config.json"
 APP_ICON = ASSETS / "icon.ico"
@@ -141,6 +161,9 @@ def load_config():
            "fullscreen": True, "tools_visible": False, "volume": 60, "muted": False,
            "hide_taskbar": True, "taskbar_hidden": False,
            "friend_db_url": "", "friend_code": "", "update_url": "", "app_usage": {},
+           "supabase_url": "", "supabase_key": "", "supabase_access_token": "",
+           "supabase_refresh_token": "", "supabase_user_id": "", "friends_username": "",
+           "share_activity": False, "has_password": False, "activity_published": False, "usage_days": {},
            "focus_done": {"date": "", "count": 0}}
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -149,14 +172,25 @@ def load_config():
             if isinstance(items, list):
                 cfg[key] = [i for i in items
                             if isinstance(i, dict) and i.get("label") and i.get("target")]
-        for key in ("wallpaper", "name", "status", "avatar", "friend_db_url", "friend_code", "update_url"):
+        for key in ("wallpaper", "name", "status", "avatar", "friend_db_url", "friend_code", "update_url",
+                    "supabase_url", "supabase_key", "supabase_access_token", "supabase_refresh_token",
+                    "supabase_user_id", "friends_username"):
             if isinstance(data.get(key), str):
                 cfg[key] = data[key]
-        for key in ("fullscreen", "tools_visible", "muted", "hide_taskbar", "taskbar_hidden"):
+        for key in ("fullscreen", "tools_visible", "muted", "hide_taskbar", "taskbar_hidden",
+                    "share_activity", "activity_published", "has_password"):
             if isinstance(data.get(key), bool):
                 cfg[key] = data[key]
         if isinstance(data.get("volume"), int):
             cfg["volume"] = max(0, min(100, data["volume"]))
+        days = data.get("usage_days")
+        if isinstance(days, dict):
+            clean = {}
+            for day, apps in days.items():
+                if isinstance(apps, dict):
+                    clean[str(day)] = {str(k): float(v) for k, v in apps.items()
+                                       if isinstance(v, (int, float))}
+            cfg["usage_days"] = clean
         usage = data.get("app_usage")
         if isinstance(usage, dict):
             cfg["app_usage"] = {str(k): v for k, v in usage.items() if isinstance(v, int)}
@@ -940,8 +974,87 @@ def user32_api():
         u.PostMessageW.restype = wintypes.BOOL
         u.FindWindowExW.argtypes = [H, H, wintypes.LPCWSTR, wintypes.LPCWSTR]
         u.FindWindowExW.restype = H
+        u.GetForegroundWindow.argtypes = []
+        u.GetForegroundWindow.restype = H
         _USER32 = u
     return _USER32
+
+
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+_K32 = None
+IGNORED_APPS = {"applicationframehost", "searchhost", "shellexperiencehost", "lockapp",
+                "startmenuexperiencehost", "textinputhost", "systemsettings", "dwm", "idle"}
+APP_NAMES = {"chrome": "Chrome", "msedge": "Edge", "firefox": "Firefox", "brave": "Brave",
+             "opera": "Opera", "code": "VS Code", "spotify": "Spotify", "discord": "Discord",
+             "telegram": "Telegram", "explorer": "File Explorer", "winword": "Word",
+             "excel": "Excel", "powerpnt": "PowerPoint", "notepad": "Notepad", "vlc": "VLC",
+             "steam": "Steam", "whatsapp": "WhatsApp", "cmd": "Terminal",
+             "windowsterminal": "Terminal", "python": "Python", "pythonw": "Python",
+             "pycharm64": "PyCharm", "blender": "Blender", "obs64": "OBS"}
+
+
+def foreground_app():
+    """Friendly name of the app in front, or None (other OS / our own window / system shell)."""
+    global _K32
+    if os.name != "nt":
+        return None
+    try:
+        u = user32_api()
+        hwnd = u.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in (0, os.getpid()):
+            return None
+        if _K32 is None:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k.OpenProcess.restype = wintypes.HANDLE
+            k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                     ctypes.POINTER(wintypes.DWORD)]
+            k.QueryFullProcessImageNameW.restype = wintypes.BOOL
+            k.CloseHandle.argtypes = [wintypes.HANDLE]
+            _K32 = k
+        handle = _K32.OpenProcess(0x1000, False, pid.value)
+        if not handle:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buf))
+            if not _K32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return None
+            stem = Path(buf.value).stem
+        finally:
+            _K32.CloseHandle(handle)
+        key = stem.lower()
+        if key in IGNORED_APPS:
+            return None
+        return APP_NAMES.get(key) or stem.replace("_", " ").replace("-", " ").title()[:24]
+    except Exception:
+        return None
+
+
+def idle_seconds():
+    """Seconds since the last keyboard / mouse input (0 on other systems)."""
+    if os.name != "nt":
+        return 0
+    try:
+        info = _LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info))
+        ctypes.windll.kernel32.GetTickCount.restype = ctypes.c_uint
+        return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return 0
+
+
+def fmt_minutes(minutes):
+    minutes = int(minutes)
+    return f"{minutes // 60}h {minutes % 60}m" if minutes >= 60 else f"{minutes}m"
 
 
 def set_taskbar_visible(visible):
@@ -2956,14 +3069,17 @@ class ProfilePanel(Popover):
         # --- switches ---
         self.sw_full = ToggleSwitch()
         self.sw_task = ToggleSwitch()
+        self.sw_share = ToggleSwitch()
         self.sw_tools = ToggleSwitch()
         self.sw_start = ToggleSwitch()
         lay.addLayout(self._row("Fullscreen", "F11", self.sw_full))
         lay.addLayout(self._row("Hide Windows taskbar", "", self.sw_task))
+        lay.addLayout(self._row("Share my activity with friends", "", self.sw_share))
         lay.addLayout(self._row("Dock tools", "H", self.sw_tools))
         lay.addLayout(self._row("Start with Windows", "", self.sw_start))
         self.sw_full.toggled.connect(win.set_fullscreen)
         self.sw_task.toggled.connect(win.set_hide_taskbar)
+        self.sw_share.toggled.connect(win.set_share_activity)
         self.sw_tools.toggled.connect(win.set_tools_visible)
         self.sw_start.toggled.connect(self.on_startup)
 
@@ -3080,6 +3196,7 @@ class ProfilePanel(Popover):
         self.v_open.setText(str(len(win.running_panel.get_running_windows())) if os.name == "nt" else "-")
         self.sw_full.set_silent(win.isFullScreen())
         self.sw_task.set_silent(win.config.get("hide_taskbar", True))
+        self.sw_share.set_silent(win.config.get("share_activity", False))
         self.sw_tools.set_silent(win.config.get("tools_visible", False))
         self.sw_start.set_silent(startup_enabled())
         self.update_ui()
@@ -3145,91 +3262,454 @@ class ProfilePanel(Popover):
 
 # ----------------------------- Running apps drawer -----------------------------
 
-# ----------------------------- Friends (Firebase Realtime Database) -----------------------------
-
-def normalize_db_url(url):
-    url = (url or "").strip()
-    if not url:
-        return ""
-    if "://" not in url:
-        url = "https://" + url
-    url = url.split("?")[0].rstrip("/")
-    if url.endswith(".json"):
-        url = url[:-5].rstrip("/")
-    return url
-
-
-def rtdb(base, path, method="GET", data=None, timeout=8):
-    """Tiny Firebase Realtime Database REST client (no extra packages needed)."""
-    body = json.dumps(data).encode("utf-8") if data is not None else None
-    req = urllib.request.Request(f"{base}/{path}.json", data=body, method=method,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8")
-    return json.loads(raw) if raw else None
-
+# ----------------------------- Friends (Supabase) -----------------------------
 
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
 def new_friend_code():
-    return "".join(secrets.choice(CODE_CHARS) for _ in range(6))
+    return "".join(secrets.choice(CODE_CHARS) for _ in range(8))
 
 
-def clean_code(text):
-    return "".join(c for c in (text or "").upper() if c in CODE_CHARS)[:6]
+def clean_friend_query(value):
+    return (value or "").strip()[:40]
 
 
-def friends_sync(base, me, name, status):
-    """Heartbeat + download friends and requests. Runs in a worker thread."""
-    put = rtdb(base, f"users/{me}", "PUT",
-               {"name": name, "status": status, "seen": {".sv": "timestamp"}})
-    now = put.get("seen") if isinstance(put, dict) else None
-    if not isinstance(now, (int, float)):
-        now = int(time.time() * 1000)
-    friends, requests = [], []
-    for code in (rtdb(base, f"friends/{me}") or {}):
-        info = rtdb(base, f"users/{code}") or {}
-        friends.append({"code": code, "name": info.get("name") or code,
-                        "status": info.get("status") or "", "seen": info.get("seen") or 0})
-    for code, info in (rtdb(base, f"requests/{me}") or {}).items():
-        requests.append({"code": code, "name": (info or {}).get("name") or code})
-    friends.sort(key=lambda f: (-(now - f["seen"] < 90000), f["name"].lower()))
-    return {"now": now, "friends": friends, "requests": requests}
+def _sb_json_request(base, api_key, path, method="GET", data=None, token=None, prefer=None, timeout=12):
+    url = base.rstrip("/") + path
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else None
+    headers = {"apikey": api_key, "Content-Type": "application/json", "Accept": "application/json"}
+    headers["Authorization"] = "Bearer " + (token or api_key)
+    if prefer:
+        headers["Prefer"] = prefer
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        try:
+            payload = json.loads(detail)
+            detail = payload.get("message") or payload.get("msg") or payload.get("error_description") or detail
+        except Exception:
+            pass
+        raise RuntimeError(f"Supabase {exc.code}: {detail[:400]}")
 
 
-def friends_add(base, me, my_name, code):
-    if code == me:
-        return "That is your own code"
-    if len(code) != 6:
-        return "A code has 6 letters/numbers"
-    if not rtdb(base, f"users/{code}"):
-        return "No one has this code"
-    if rtdb(base, f"friends/{me}/{code}"):
-        return "Already your friend"
-    if rtdb(base, f"requests/{me}/{code}"):          # they asked first -> just accept
-        friends_accept(base, me, code)
+def _sb_refresh_session(ctx):
+    refresh = ctx.get("refresh_token")
+    if not refresh:
+        raise RuntimeError("No saved session. Connect again.")
+    data = _sb_json_request(ctx["url"], ctx["key"], "/auth/v1/token?grant_type=refresh_token",
+                            "POST", {"refresh_token": refresh}, token=ctx["key"])
+    ctx["access_token"] = data["access_token"]
+    ctx["refresh_token"] = data.get("refresh_token", refresh)
+    ctx["user_id"] = (data.get("user") or {}).get("id") or ctx.get("user_id")
+    return ctx["access_token"]
+
+
+def _sb_api(ctx, path, method="GET", data=None, prefer=None):
+    if not ctx.get("access_token"):
+        _sb_refresh_session(ctx)
+    try:
+        return _sb_json_request(ctx["url"], ctx["key"], path, method, data,
+                                ctx["access_token"], prefer)
+    except RuntimeError as exc:
+        if "Supabase 401:" not in str(exc) and "Supabase 403:" not in str(exc):
+            raise
+        _sb_refresh_session(ctx)
+        return _sb_json_request(ctx["url"], ctx["key"], path, method, data,
+                                ctx["access_token"], prefer)
+
+
+def _sb_profile(ctx, user_id):
+    q = quote(f"id=eq.{user_id}", safe="=.,-_")
+    rows = _sb_api(ctx, f"/rest/v1/profiles?select=id,username,display_name,friend_code,last_seen,status&{q}") or []
+    return rows[0] if rows else None
+
+
+class FriendsInitError(RuntimeError):
+    """Connect failed after sign-in; carries the session so a retry reuses it (no orphan accounts)."""
+    ctx = None
+
+
+def _like_exact(text):
+    """Escape a value for PostgREST ilike so '_' and '\\' are matched literally (no wildcards)."""
+    return text.replace("\\", "\\\\").replace("_", "\\_")
+
+
+def _is_duplicate(exc):
+    text = str(exc).lower()
+    return "duplicate" in text or "23505" in text or "already exists" in text
+
+
+def _ensure_profile(ctx, username, display_name):
+    """Create / refresh this account's public profile. Returns the friend code."""
+    username = username.strip()
+    try:
+        taken = _sb_api(ctx, "/rest/v1/profiles?select=id&limit=1&" +
+                        quote(f"username=ilike.{_like_exact(username)}&id=neq.{ctx['user_id']}", safe="=.-_&"))
+        if taken:
+            raise FriendsInitError("This username is already taken. Choose another one.")
+        existing = _sb_profile(ctx, ctx["user_id"])
+        code = (existing or {}).get("friend_code") or new_friend_code()
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        display = display_name.strip() or username
+        if existing:
+            own_filter = quote(f"id=eq.{ctx['user_id']}", safe="=.-_")
+            _sb_api(ctx, f"/rest/v1/profiles?{own_filter}", "PATCH",
+                    {"username": username, "display_name": display, "last_seen": now_iso},
+                    "return=minimal")
+        else:
+            payload = {"id": ctx["user_id"], "username": username, "display_name": display,
+                       "friend_code": code, "last_seen": now_iso, "status": "Online"}
+            _sb_api(ctx, "/rest/v1/profiles", "POST", payload, "return=minimal")
+    except Exception as exc:
+        err = exc if isinstance(exc, FriendsInitError) else FriendsInitError(
+            "This username is already taken. Choose another one." if _is_duplicate(exc) else str(exc))
+        err.ctx = ctx
+        raise err
+    return code
+
+
+def friends_initialize(url, api_key, refresh_token, username, display_name):
+    ctx = {"url": url.rstrip("/"), "key": api_key.strip(), "refresh_token": refresh_token or ""}
+    if ctx["refresh_token"]:
+        try:
+            _sb_refresh_session(ctx)
+        except Exception:
+            ctx["refresh_token"] = ""
+    if not ctx.get("access_token"):
+        data = _sb_json_request(ctx["url"], ctx["key"], "/auth/v1/signup", "POST", {"data": {}}, token=ctx["key"])
+        ctx["access_token"] = data.get("access_token")
+        ctx["refresh_token"] = data.get("refresh_token")
+        ctx["user_id"] = (data.get("user") or {}).get("id")
+    if not ctx.get("access_token") or not ctx.get("user_id"):
+        raise RuntimeError("Anonymous sign-in did not return a session. Turn on Anonymous Sign-ins in Supabase.")
+    code = _ensure_profile(ctx, username, display_name)
+    return {"ctx": ctx, "friend_code": code, "username": username.strip()}
+
+
+def _auth_error(exc):
+    text = str(exc).lower()
+    if "invalid login" in text or "invalid_credentials" in text:
+        return "Wrong email or password"
+    if "not confirmed" in text:
+        return "Email is not confirmed yet. Use the code that was sent to you."
+    if "at least" in text and "character" in text:
+        return "Password is too short (use 6 or more characters)"
+    if "otp" in text and ("expired" in text or "invalid" in text):
+        return "Wrong or expired code. Ask for a new one."
+    if "token has expired" in text or "invalid" in text and "token" in text:
+        return "Wrong or expired code. Ask for a new one."
+    if "429" in text or "rate limit" in text or "too many" in text:
+        return "Too many tries. Wait a few minutes and try again."
+    if "signups not allowed" in text or "signup is disabled" in text or "signups are disabled" in text:
+        return "Sign-ups are disabled in Supabase (Authentication > Sign In / Providers)."
+    if "error sending" in text or "smtp" in text:
+        return "Supabase could not send the e-mail. Check the SMTP settings (see SUPABASE_EMAIL.txt)."
+    if "invalid format" in text or "unable to validate email" in text:
+        return "This e-mail address is not valid"
+    return str(exc)
+
+
+def _auth_post(url, key, path, body, token=None, method="POST"):
+    try:
+        return _sb_json_request(url.rstrip("/"), key, path, method, body, token=token or key)
+    except RuntimeError as exc:
+        raise RuntimeError(_auth_error(exc))
+
+
+def _session_ctx(url, key, data):
+    user = (data or {}).get("user") or {}
+    ctx = {"url": url.rstrip("/"), "key": key.strip(), "access_token": (data or {}).get("access_token"),
+           "refresh_token": (data or {}).get("refresh_token") or "", "user_id": user.get("id")}
+    if not ctx["access_token"] or not ctx["user_id"]:
+        raise RuntimeError("Sign-in did not return a session")
+    ctx["meta_username"] = (user.get("user_metadata") or {}).get("username", "")
+    return ctx
+
+
+def _finish_login(ctx, username, display_name):
+    """Signed in: make sure this account has a public profile (username + friend ID)."""
+    username = (username or ctx.get("meta_username") or "").strip()
+    if not username and not _sb_profile(ctx, ctx["user_id"]):
+        return {"step": "profile", "ctx": ctx}
+    if not username:
+        username = (_sb_profile(ctx, ctx["user_id"]) or {}).get("username", "")
+    try:
+        code = _ensure_profile(ctx, username, display_name)
+    except FriendsInitError as exc:
+        return {"step": "profile", "ctx": ctx, "error": str(exc)}
+    return {"step": "done", "ctx": ctx, "friend_code": code, "username": username}
+
+
+def friends_auth(url, key, action, email, password="", username="", code="", display_name=""):
+    """E-mail accounts. A 6-digit code from the e-mail confirms sign-ups and resets passwords."""
+    email = email.strip().lower()
+    if action == "login":
+        data = _auth_post(url, key, "/auth/v1/token?grant_type=password", {"email": email, "password": password})
+        return _finish_login(_session_ctx(url, key, data), "", display_name)
+    if action == "signup":
+        data = _auth_post(url, key, "/auth/v1/signup",
+                          {"email": email, "password": password, "data": {"username": username}})
+        if (data or {}).get("access_token"):                    # project does not require confirmation
+            return _finish_login(_session_ctx(url, key, data), username, display_name)
+        return {"step": "code", "kind": "signup"}
+    if action == "resend":
+        _auth_post(url, key, "/auth/v1/resend", {"type": "signup", "email": email})
+        return {"step": "code", "kind": "signup"}
+    if action == "recover":
+        _auth_post(url, key, "/auth/v1/recover", {"email": email})
+        return {"step": "code", "kind": "recovery"}
+    if action in ("verify", "reset"):
+        kind = "signup" if action == "verify" else "recovery"
+        data = _auth_post(url, key, "/auth/v1/verify", {"type": kind, "email": email, "token": code.strip()})
+        ctx = _session_ctx(url, key, data)
+        if kind == "recovery":
+            _auth_post(url, key, "/auth/v1/user", {"password": password}, token=ctx["access_token"], method="PUT")
+        return _finish_login(ctx, username if kind == "signup" else "", display_name)
+    raise RuntimeError("Unknown action")
+
+
+def google_login(url, key, display_name, timeout=180):
+    """Sign in with Google: open the browser, catch the answer on 127.0.0.1, exchange the code (PKCE)."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    redirect = f"http://127.0.0.1:{OAUTH_PORT}/callback"
+    got = {}
+    done = threading.Event()
+
+    class Catcher(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            query = dict(urllib.parse.parse_qsl(urlparse(self.path).query))
+            if urlparse(self.path).path != "/callback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            got.update(query)
+            body = ("<html><body style='font-family:sans-serif;background:#111;color:#fff;text-align:center;"
+                    "padding-top:80px'><h2>You can close this tab</h2><p>Return to Glass Desktop.</p></body></html>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
+            done.set()
+
+    try:
+        server = HTTPServer(("127.0.0.1", OAUTH_PORT), Catcher)
+    except OSError:
+        raise RuntimeError(f"Port {OAUTH_PORT} is busy. Close other copies of the app and try again.")
+    server.timeout = 0.5
+    auth_url = (url.rstrip("/") + "/auth/v1/authorize?provider=google&redirect_to=" + quote(redirect, safe="")
+                + "&code_challenge=" + challenge + "&code_challenge_method=s256")
+    try:
+        webbrowser.open(auth_url)
+        end = time.time() + timeout
+        while not done.is_set() and time.time() < end:
+            server.handle_request()
+    finally:
+        server.server_close()
+    if not got:
+        raise RuntimeError("Google sign-in timed out. Try again.")
+    if got.get("error") or got.get("error_description"):
+        raise RuntimeError(str(got.get("error_description") or got.get("error"))[:160])
+    if not got.get("code"):
+        raise RuntimeError("Google sign-in did not return a code")
+    data = _auth_post(url, key, "/auth/v1/token?grant_type=pkce",
+                      {"auth_code": got["code"], "code_verifier": verifier})
+    return _finish_login(_session_ctx(url, key, data), "", display_name)
+
+
+def friends_finish(ctx, username, display_name):
+    return _finish_login(ctx, username, display_name)
+
+
+def _keep_ctx(fn):
+    """Run fn(ctx, ...) and, if it fails, attach ctx to the error: a refresh token that was
+    rotated during the call must still be saved, or the next sync would lose the session."""
+    def wrapper(ctx, *args):
+        try:
+            return fn(ctx, *args)
+        except Exception as exc:
+            try:
+                exc.ctx = ctx
+            except Exception:
+                pass
+            raise
+    return wrapper
+
+
+_ACTIVITY = {"ok": None}      # None = unknown, False = the "activity" table does not exist yet
+
+
+def _activity_missing(exc):
+    text = str(exc).lower()
+    return "activity" in text and ("schema cache" in text or "does not exist" in text or "404" in text)
+
+
+def _profiles_for_ids(ctx, ids):
+    if not ids:
+        return {}
+    joined = ",".join(ids)
+    filt = quote(f"id=in.({joined})", safe="=(),.-_")
+    rows = _sb_api(ctx, f"/rest/v1/profiles?select=id,username,display_name,friend_code,last_seen,status&{filt}") or []
+    return {r["id"]: r for r in rows}
+
+
+def _activity_for_ids(ctx, ids):
+    """Friends' shared activity. RLS only returns rows of accepted friends."""
+    if not ids or _ACTIVITY["ok"] is False:
+        return {}
+    filt = quote(f"user_id=in.({','.join(ids)})", safe="=(),.-_")
+    try:
+        rows = _sb_api(ctx, f"/rest/v1/activity?select=user_id,stats,updated_at&{filt}") or []
+        _ACTIVITY["ok"] = True
+    except RuntimeError as exc:
+        if _activity_missing(exc):
+            _ACTIVITY["ok"] = False
+            return {}
+        raise
+    return {r["user_id"]: r for r in rows}
+
+
+def friends_sync(ctx, name, status, stats=None, clear_stats=False):
+    uid = ctx["user_id"]
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    uid_filter = quote(f"id=eq.{uid}", safe="=.-_")
+    _sb_api(ctx, f"/rest/v1/profiles?{uid_filter}", "PATCH",
+            {"display_name": name, "status": status or "Online", "last_seen": now_iso}, "return=minimal")
+
+    published = None
+    if _ACTIVITY["ok"] is not False:
+        try:
+            if stats is not None:
+                _sb_api(ctx, "/rest/v1/activity?on_conflict=user_id", "POST",
+                        {"user_id": uid, "stats": stats, "updated_at": now_iso},
+                        "resolution=merge-duplicates,return=minimal")
+                published = True
+            elif clear_stats:
+                _sb_api(ctx, "/rest/v1/activity?" + quote(f"user_id=eq.{uid}", safe="=.-_"),
+                        "DELETE", None, "return=minimal")
+                published = False
+        except RuntimeError as exc:
+            if _activity_missing(exc):
+                _ACTIVITY["ok"] = False
+            else:
+                raise
+
+    own = quote(f"to_user=eq.{uid}&status=eq.pending", safe="=.-_&")
+    incoming = _sb_api(ctx, f"/rest/v1/friend_requests?select=from_user,to_user,status,created_at&{own}") or []
+    accepted_filter = quote(f"status=eq.accepted&or=(from_user.eq.{uid},to_user.eq.{uid})", safe="=(),.-_&")
+    accepted = _sb_api(ctx, f"/rest/v1/friend_requests?select=from_user,to_user,status,created_at&{accepted_filter}") or []
+    ids = set()
+    for row in incoming + accepted:
+        ids.add(row["from_user"] if row["to_user"] == uid else row["to_user"])
+    profiles = _profiles_for_ids(ctx, list(ids))
+    activity = _activity_for_ids(ctx, [r["from_user"] if r["to_user"] == uid else r["to_user"] for r in accepted])
+    requests, friends = [], []
+    for row in incoming:
+        p = profiles.get(row["from_user"], {})
+        requests.append({"user_id": row["from_user"], "code": p.get("friend_code", ""),
+                         "name": p.get("display_name") or p.get("username") or "User"})
+    for row in accepted:
+        fid = row["from_user"] if row["to_user"] == uid else row["to_user"]
+        p = profiles.get(fid, {})
+        act = activity.get(fid) or {}
+        friends.append({"user_id": fid, "code": p.get("friend_code", ""),
+                        "username": p.get("username") or "",
+                        "name": p.get("display_name") or p.get("username") or "User",
+                        "status": p.get("status") or "", "seen": p.get("last_seen") or "",
+                        "friend_since": row.get("created_at") or "",
+                        "stats": act.get("stats"), "activity_updated": act.get("updated_at") or ""})
+    friends.sort(key=lambda f: f["name"].lower())
+    return {"friends": friends, "requests": requests, "now": now_iso, "ctx": ctx, "published": published}
+
+
+def friends_add(ctx, query):
+    query = clean_friend_query(query)
+    if not query:
+        return "Enter a friend ID or username"
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,24}", query):
+        return "Use the friend's ID or username (English letters, numbers, _)"
+    uid = ctx["user_id"]
+    rows = []
+    if len(query) == 8 and query.upper() == query and all(c in CODE_CHARS for c in query):
+        filt = quote(f"friend_code=eq.{query}", safe="=.-_")
+        rows = _sb_api(ctx, f"/rest/v1/profiles?select=id,username,display_name,friend_code&{filt}&limit=2") or []
+    if not rows:                                   # also covers usernames that look like an ID
+        filt = quote(f"username=ilike.{_like_exact(query)}", safe="=.-_")
+        rows = _sb_api(ctx, f"/rest/v1/profiles?select=id,username,display_name,friend_code&{filt}&limit=2") or []
+    if not rows:
+        return "No user found with that ID or username"
+    if len(rows) > 1:
+        return "More than one match. Use the friend's exact ID"
+    target = rows[0]
+    if target["id"] == uid:
+        return "You cannot add yourself"
+    pair = quote(f"from_user=eq.{target['id']}&to_user=eq.{uid}&status=eq.pending", safe="=.-_&")
+    reverse = _sb_api(ctx, f"/rest/v1/friend_requests?select=from_user,to_user&{pair}") or []
+    if reverse:
+        _sb_api(ctx, f"/rest/v1/friend_requests?{pair}", "PATCH", {"status": "accepted"}, "return=minimal")
         return "Friend added!"
-    rtdb(base, f"requests/{code}/{me}", "PUT", {"name": my_name})
+    accepted = quote(f"status=eq.accepted&or=(and(from_user.eq.{uid},to_user.eq.{target['id']}),and(from_user.eq.{target['id']},to_user.eq.{uid}))", safe="=(),.-_&")
+    if _sb_api(ctx, f"/rest/v1/friend_requests?select=from_user&{accepted}"):
+        return "Already your friend"
+    mine = quote(f"from_user=eq.{uid}&to_user=eq.{target['id']}", safe="=.-_&")
+    prior = _sb_api(ctx, f"/rest/v1/friend_requests?select=status&{mine}") or []
+    if prior:
+        if prior[0].get("status") == "pending":
+            return "Request already sent"
+        _sb_api(ctx, f"/rest/v1/friend_requests?{mine}", "DELETE", None, "return=minimal")   # old declined one
+    body = {"from_user": uid, "to_user": target["id"], "status": "pending"}
+    try:
+        _sb_api(ctx, "/rest/v1/friend_requests", "POST", body, "return=minimal")
+    except RuntimeError as exc:
+        if _is_duplicate(exc):
+            return "Request already sent"
+        raise
     return "Request sent"
 
 
-def friends_accept(base, me, code):
-    rtdb(base, f"friends/{me}/{code}", "PUT", True)
-    rtdb(base, f"friends/{code}/{me}", "PUT", True)
-    rtdb(base, f"requests/{me}/{code}", "DELETE")
+def friends_accept(ctx, friend_id):
+    uid = ctx["user_id"]
+    filt = quote(f"from_user=eq.{friend_id}&to_user=eq.{uid}&status=eq.pending", safe="=.-_&")
+    _sb_api(ctx, f"/rest/v1/friend_requests?{filt}", "PATCH", {"status": "accepted"}, "return=minimal")
     return "Friend added!"
 
 
-def friends_decline(base, me, code):
-    rtdb(base, f"requests/{me}/{code}", "DELETE")
-    return "Request removed"
+def friends_decline(ctx, friend_id):
+    uid = ctx["user_id"]
+    filt = quote(f"from_user=eq.{friend_id}&to_user=eq.{uid}&status=eq.pending", safe="=.-_&")
+    _sb_api(ctx, f"/rest/v1/friend_requests?{filt}", "PATCH", {"status": "rejected"}, "return=minimal")
+    return "Request declined"
 
 
-def friends_remove(base, me, code):
-    rtdb(base, f"friends/{me}/{code}", "DELETE")
-    rtdb(base, f"friends/{code}/{me}", "DELETE")
+def friends_remove(ctx, friend_id):
+    uid = ctx["user_id"]
+    filt = quote(f"or=(and(from_user.eq.{uid},to_user.eq.{friend_id}),and(from_user.eq.{friend_id},to_user.eq.{uid}))&status=eq.accepted", safe="=(),.-_&")
+    _sb_api(ctx, f"/rest/v1/friend_requests?{filt}", "DELETE", None, "return=minimal")
     return "Friend removed"
+
+
+def _is_recent(iso_value, seconds=100):
+    """True when an ISO timestamp from the server is newer than `seconds` (any fraction length)."""
+    if not iso_value:
+        return False
+    try:
+        value = str(iso_value).strip().replace("Z", "+00:00")
+        value = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], value)
+        value = re.sub(r"([+-]\d\d)$", r"\1:00", value)
+        moment = datetime.datetime.fromisoformat(value)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=datetime.timezone.utc)
+        return time.time() - moment.timestamp() < seconds
+    except Exception:
+        return False
 
 
 class FriendsService(QObject):
@@ -3239,68 +3719,369 @@ class FriendsService(QObject):
         super().__init__(win)
         self.win = win
         self.friends, self.requests = [], []
-        self.now = 0
+        self.now = ""
         self.error = ""
         self.busy = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
 
     @property
-    def base(self):
-        return normalize_db_url(self.win.config.get("friend_db_url") or FIREBASE_URL)
-
-    @property
     def configured(self):
-        return bool(self.base)
+        c = self.win.config
+        return bool(c.get("supabase_access_token") and c.get("supabase_user_id"))
+
+    def context(self):
+        c = self.win.config
+        return {"url": SUPABASE_URL, "key": SUPABASE_PUBLISHABLE_KEY,
+                "access_token": c.get("supabase_access_token", ""), "refresh_token": c.get("supabase_refresh_token", ""),
+                "user_id": c.get("supabase_user_id", "")}
+
+    def save_context(self, ctx):
+        c = self.win.config
+        c["supabase_access_token"] = ctx.get("access_token", "")
+        c["supabase_refresh_token"] = ctx.get("refresh_token", "")
+        c["supabase_user_id"] = ctx.get("user_id", "")
+        self.win.save_config()
 
     def my_code(self):
-        cfg = self.win.config
-        if not cfg.get("friend_code"):
-            cfg["friend_code"] = new_friend_code()
-            self.win.save_config()
-        return cfg["friend_code"]
+        return self.win.config.get("friend_code", "")
 
     def start(self):
         if self.configured:
-            self.timer.start(30000)
+            self.timer.start(45000)
             self.refresh()
         else:
             self.timer.stop()
+            self.changed.emit()
 
     def online(self, friend):
-        return self.now - friend["seen"] < 90000
+        return _is_recent(friend.get("seen"), 100)
 
     def refresh(self):
         if not self.configured or self.busy:
             return
         self.busy = True
         cfg = self.win.config
-        run_job(friends_sync, self._synced, self.base, self.my_code(),
-                self.win.profile_name(), cfg.get("status", ""))
+        stats = self.win.activity_payload()
+        clear = stats is None and cfg.get("activity_published", False)
+        run_job(_keep_ctx(friends_sync), self._synced, self.context(), self.win.profile_name(),
+                cfg.get("status", ""), stats, clear)
+        self.changed.emit()
 
     def _synced(self, result, error):
         self.busy = False
         if error is not None:
-            self.error = "No connection to the friends server"
+            self.error = str(error)[:180]
+            if getattr(error, "ctx", None):
+                self.save_context(error.ctx)              # keep a rotated refresh token
         else:
             self.error = ""
-            old = {r["code"] for r in self.requests}
+            self.save_context(result["ctx"])
+            if result.get("published") is not None:
+                self.win.config["activity_published"] = result["published"]
+                self.win.save_config()
             self.friends, self.requests, self.now = result["friends"], result["requests"], result["now"]
-            if any(r["code"] not in old for r in self.requests):
-                tip().flash("New friend request!", self.win.friends_btn, "bottom", "Press F", 4000)
         self.changed.emit()
 
-    def act(self, fn, *args, done=None):
+    def act(self, fn, *args, done=None, _tries=0):
         if not self.configured:
             return
-        me = self.my_code()
-
+        if self.busy:                                       # a sync is running: try again shortly
+            if _tries < 12:
+                QTimer.singleShot(500, lambda: self.act(fn, *args, done=done, _tries=_tries + 1))
+            elif done:
+                done("Server is busy, try again")
+            return
+        self.busy = True
+        ctx = self.context()
+        def work():
+            try:
+                message = fn(ctx, *args)
+            except Exception as exc:
+                exc.ctx = ctx
+                raise
+            return {"message": message, "ctx": ctx}
         def finished(result, error):
-            msg = result if error is None else "Could not reach the server"
+            self.busy = False
+            if error is None:
+                self.save_context(result["ctx"])
+                msg = result["message"]
+            else:
+                if getattr(error, "ctx", None):
+                    self.save_context(error.ctx)
+                msg = str(error)[:180]
             if done:
                 done(msg)
             self.refresh()
-        run_job(fn, finished, self.base, me, *args)
+        run_job(work, finished)
+
+
+class FriendProfilePanel(Popover):
+    """Rich friend profile. Usage statistics appear only when that friend opted in."""
+    def __init__(self, win, owner):
+        super().__init__(win, owner, 400, 660)
+        self.friend = {}
+        self.setStyleSheet("""
+            QLabel { color:white; background:transparent; }
+            QPushButton#action { background:rgba(255,255,255,22); color:white; border:1px solid rgba(255,255,255,28);
+                                 border-radius:12px; padding:8px 10px; font-size:11px; }
+            QPushButton#action:hover { background:rgba(255,255,255,42); }
+            QPushButton#remove { background:rgba(210,65,65,35); color:#ffaaaa; border:1px solid rgba(230,90,90,60);
+                                 border-radius:12px; padding:8px 10px; font-size:11px; }
+            QPushButton#remove:hover { background:rgba(210,65,65,100); }
+            QScrollArea { background:transparent; border:none; }
+            QScrollBar:vertical { width:0px; }
+        """)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(9)
+
+        title_row = QHBoxLayout()
+        title = QLabel("BITARO USER PROFILE")
+        title.setStyleSheet("font-size:10px; color:rgba(255,255,255,125); letter-spacing:2px; font-weight:bold;")
+        title_row.addWidget(title)
+        title_row.addStretch()
+        close = QPushButton("×")
+        close.setFixedSize(28, 28)
+        close.setStyleSheet("QPushButton{background:rgba(255,255,255,18);color:white;border:0;border-radius:14px;font-size:18px;} QPushButton:hover{background:rgba(255,255,255,38);}")
+        close.clicked.connect(self.close_pop)
+        title_row.addWidget(close)
+        root.addLayout(title_row)
+
+        header = QHBoxLayout()
+        self.avatar = QLabel()
+        self.avatar.setFixedSize(76, 76)
+        header.addWidget(self.avatar)
+        info = QVBoxLayout()
+        info.setSpacing(3)
+        self.name_label = QLabel("Friend")
+        self.name_label.setStyleSheet("font-size:21px; font-weight:bold;")
+        self.username_label = QLabel("@username")
+        self.username_label.setStyleSheet("font-size:12px; color:rgba(255,255,255,145);")
+        self.presence_label = QLabel("Offline")
+        self.presence_label.setStyleSheet("font-size:11px; color:rgba(255,255,255,145);")
+        info.addWidget(self.name_label)
+        info.addWidget(self.username_label)
+        info.addWidget(self.presence_label)
+        info.addStretch()
+        header.addLayout(info, 1)
+        root.addLayout(header)
+
+        self.status_card = self._card("STATUS MESSAGE", "—")
+        root.addWidget(self.status_card[0])
+
+        root.addWidget(self._section("ACCOUNT DETAILS"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        self.username_value = self._tile(grid, 0, 0, "USERNAME")
+        self.friend_code_value = self._tile(grid, 0, 1, "FRIEND CODE")
+        self.user_id_value = self._tile(grid, 1, 0, "ACCOUNT ID")
+        self.friend_since_value = self._tile(grid, 1, 1, "FRIENDS SINCE")
+        root.addLayout(grid)
+
+        root.addWidget(self._section("SHARED ACTIVITY"))
+        self.activity_hint = QLabel("This friend has not shared activity details.")
+        self.activity_hint.setWordWrap(True)
+        self.activity_hint.setStyleSheet("font-size:11px; color:rgba(255,255,255,135); padding:5px 2px;")
+        root.addWidget(self.activity_hint)
+        self.activity_box = QWidget()
+        self.activity_box.setAttribute(Qt.WA_StyledBackground, True)
+        self.activity_box.setObjectName("abox")
+        self.activity_box.setStyleSheet("#abox{background:rgba(255,255,255,13); border:1px solid rgba(255,255,255,20); border-radius:14px;}")
+        ab = QVBoxLayout(self.activity_box)
+        ab.setContentsMargins(12, 10, 12, 10)
+        ab.setSpacing(7)
+        self.top_app_label = QLabel("Most used today: —")
+        self.top3_label = QLabel("Other apps: —")
+        self.active_label = QLabel("Active time: —")
+        self.windows_label = QLabel("Open windows: —")
+        self.focus_label = QLabel("Focus sessions: —")
+        self.activity_time_label = QLabel("Updated: —")
+        self.week_label = QLabel("This week: —")
+        for w in (self.top_app_label, self.week_label, self.top3_label, self.active_label,
+                  self.windows_label, self.focus_label, self.activity_time_label):
+            w.setStyleSheet("font-size:11px; color:rgba(255,255,255,205);")
+            w.setWordWrap(True)
+            ab.addWidget(w)
+        root.addWidget(self.activity_box)
+
+        self.last_seen_card = self._card("LAST SEEN", "Not available")
+        root.addWidget(self.last_seen_card[0])
+        note = QLabel("App-usage details are visible only when the friend enables ‘Share my activity with friends’.")
+        note.setWordWrap(True)
+        note.setStyleSheet("font-size:9px; color:rgba(255,255,255,95);")
+        root.addWidget(note)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(7)
+        self.copy_id_btn = QPushButton("Copy account ID")
+        self.copy_id_btn.setObjectName("action")
+        self.copy_id_btn.clicked.connect(self.copy_user_id)
+        self.copy_code_btn = QPushButton("Copy friend code")
+        self.copy_code_btn.setObjectName("action")
+        self.copy_code_btn.clicked.connect(self.copy_friend_code)
+        self.remove_btn = QPushButton("Remove")
+        self.remove_btn.setObjectName("remove")
+        self.remove_btn.clicked.connect(self.remove_friend)
+        actions.addWidget(self.copy_id_btn, 1)
+        actions.addWidget(self.copy_code_btn, 1)
+        actions.addWidget(self.remove_btn)
+        root.addLayout(actions)
+
+    def _section(self, text):
+        label = QLabel(text)
+        label.setStyleSheet("font-size:10px; color:rgba(255,255,255,120); letter-spacing:1.5px; font-weight:bold;")
+        return label
+
+    def _card(self, caption, value):
+        card = QWidget()
+        card.setAttribute(Qt.WA_StyledBackground, True)
+        card.setObjectName("card")
+        card.setStyleSheet("#card{background:rgba(255,255,255,13); border:1px solid rgba(255,255,255,20); border-radius:13px;}")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(2)
+        cap = QLabel(caption)
+        cap.setStyleSheet("font-size:9px; color:rgba(255,255,255,115); letter-spacing:1px;")
+        val = QLabel(value)
+        val.setWordWrap(True)
+        val.setStyleSheet("font-size:12px; font-weight:bold;")
+        lay.addWidget(cap)
+        lay.addWidget(val)
+        return card, val
+
+    def _tile(self, grid, row, col, caption):
+        card, value = self._card(caption, "—")
+        grid.addWidget(card, row, col)
+        return value
+
+    def target_pos(self):
+        # beside the friends list (a stable anchor: the rows are rebuilt on every refresh)
+        o = self.owner.mapTo(self.win, QPoint(0, 0))
+        x = o.x() + self.owner.width() + 12
+        if x + self.width() > self.win.width() - 14:
+            x = o.x() - self.width() - 12
+        return self.clamp(x, o.y())
+
+    def open_for(self, friend):
+        self.friend = dict(friend)
+        if self.is_open:
+            self.on_open()
+        else:
+            self.open_pop()
+
+    def refresh_from(self, friends):
+        """Called after every sync: keep the open profile up to date (or close it if unfriended)."""
+        if not self.is_open:
+            return
+        fresh = next((f for f in friends if f.get("user_id") == self.friend.get("user_id")), None)
+        if fresh is None:
+            self.close_pop()
+        else:
+            self.friend = dict(fresh)
+            self.on_open()
+
+    @staticmethod
+    def _ago(value):
+        """'3 min ago' / '2 h ago' / date, from an ISO timestamp."""
+        try:
+            import datetime as _dt
+            text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], str(value).replace("Z", "+00:00"))
+            text = re.sub(r"([+-]\d\d)$", r"\1:00", text)
+            moment = _dt.datetime.fromisoformat(text)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=_dt.timezone.utc)
+            seconds = max(0, time.time() - moment.timestamp())
+        except Exception:
+            return ""
+        if seconds < 90:
+            return "just now"
+        if seconds < 3600:
+            return f"{int(seconds // 60)} min ago"
+        if seconds < 86400:
+            return f"{int(seconds // 3600)} h ago"
+        return f"{int(seconds // 86400)} days ago"
+
+    @staticmethod
+    def _date(value, with_time=False):
+        if not value:
+            return "Unavailable"
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone()
+            return dt.strftime("%Y-%m-%d  %H:%M" if with_time else "%Y-%m-%d")
+        except Exception:
+            return str(value)[:19].replace("T", " ")
+
+    @staticmethod
+    def _duration(minutes):
+        try:
+            minutes = max(0, int(minutes or 0))
+        except Exception:
+            minutes = 0
+        hours, mins = divmod(minutes, 60)
+        return f"{hours}h {mins}m" if hours else f"{mins}m"
+
+    def on_open(self):
+        f = self.friend
+        name = f.get("name") or "Bitaro user"
+        username = f.get("username") or "Not set"
+        online = _is_recent(f.get("seen"), 100)
+        self.avatar.setPixmap(avatar_pixmap(None, 76, name))
+        self.name_label.setText(name)
+        self.username_label.setText("@" + username if username != "Not set" else "Username unavailable")
+        self.presence_label.setText("● Online" if online else "○ Offline")
+        self.presence_label.setStyleSheet("font-size:11px; color:%s;" % ("#62d6a0" if online else "rgba(255,255,255,145)"))
+        self.status_card[1].setText(f.get("status") or "No status message")
+        self.username_value.setText(username)
+        self.friend_code_value.setText(f.get("code") or "Unavailable")
+        uid = f.get("user_id") or ""
+        self.user_id_value.setText(uid[:8] + "…" if len(uid) > 12 else (uid or "Unavailable"))
+        self.friend_since_value.setText(self._date(f.get("friend_since")))
+        ago = self._ago(f.get("seen"))
+        self.last_seen_card[1].setText("Active now" if online else
+                                       (f"{ago}  ({self._date(f.get('seen'), True)})" if ago else "Not available"))
+
+        stats = f.get("stats")
+        today = time.strftime("%Y-%m-%d")
+        shared = isinstance(stats, dict) and stats.get("day") == today
+        self.activity_box.setVisible(shared)
+        self.activity_hint.setVisible(not shared)
+        if shared:
+            top = stats.get("top_app") or "No app data"
+            top_min = self._duration(stats.get("top_min", 0))
+            top3 = stats.get("top3") or []
+            others = ", ".join(f"{item[0]} ({self._duration(item[1])})" for item in top3[1:3] if isinstance(item, (list, tuple)) and len(item) > 1)
+            self.top_app_label.setText(f"Most used today: {top}  ·  {top_min}")
+            self.top3_label.setText("Other apps: " + (others or "No other app data"))
+            self.active_label.setText("Active time: " + self._duration(stats.get("total_min", 0)))
+            self.windows_label.setText("Open windows: " + str(stats.get("open_apps", 0)))
+            self.focus_label.setText("Focus sessions: " + str(stats.get("focus", 0)))
+            self.activity_time_label.setText("Updated: " + self._date(f.get("activity_updated"), True))
+            week = stats.get("week_top3") or []
+            if week:
+                items = ", ".join(f"{i[0]} ({self._duration(i[1])})" for i in week
+                                  if isinstance(i, (list, tuple)) and len(i) > 1)
+                self.week_label.setText(f"This week ({self._duration(stats.get('week_total_min', 0))}): {items}")
+            else:
+                self.week_label.setText("This week: no data yet")
+
+    def copy_user_id(self):
+        QApplication.clipboard().setText(self.friend.get("user_id", ""))
+        tip().flash("Account ID copied", self.copy_id_btn, "top", "", 1800)
+
+    def copy_friend_code(self):
+        QApplication.clipboard().setText(self.friend.get("code", ""))
+        tip().flash("Friend code copied", self.copy_code_btn, "top", "", 1800)
+
+    def remove_friend(self):
+        friend_id = self.friend.get("user_id")
+        if not friend_id:
+            return
+        self.close_pop()
+        self.win.friends.act(friends_remove, friend_id,
+                             done=lambda msg: tip().flash(msg, self.win.friends_btn, "top", "", 2400))
 
 
 class FriendsButton(QPushButton):
@@ -3355,8 +4136,9 @@ class FriendsButton(QPushButton):
 
 class FriendsPanel(Popover):
     def __init__(self, win, owner):
-        super().__init__(win, owner, 360, 480)
+        super().__init__(win, owner, 370, 500)
         self.service = win.friends
+        self.friend_details = FriendProfilePanel(win, self)
         self.setStyleSheet("""
             QLabel { color:white; background:transparent; }
             QLineEdit { background:rgba(255,255,255,18); color:white; border:1px solid rgba(255,255,255,40);
@@ -3366,88 +4148,96 @@ class FriendsPanel(Popover):
                               border-radius:12px; padding:9px 14px; font-size:12px; }
             QPushButton#act:hover { background:rgba(255,255,255,52); }
             QPushButton#ok { background:rgba(84,196,140,200); border:none; border-radius:13px; }
-            QPushButton#ok:hover { background:rgba(84,196,140,255); }
             QPushButton#no { background:rgba(255,255,255,26); border:none; border-radius:13px; }
-            QPushButton#no:hover { background:rgba(210,70,70,220); }
             QScrollArea { background:transparent; border:none; }
             QScrollBar:vertical { width:0px; }
         """)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(22, 18, 22, 18)
         lay.setSpacing(10)
-
         head = QHBoxLayout()
         title = QLabel("Friends")
         title.setStyleSheet("font-size:19px; font-weight:bold;")
         self.state = QLabel("")
-        self.state.setStyleSheet("color:rgba(255,255,255,120); font-size:11px;")
+        self.state.setStyleSheet("color:rgba(255,255,255,120); font-size:10px;")
         head.addWidget(title)
         head.addStretch()
         head.addWidget(self.state)
         lay.addLayout(head)
 
-        # ---- setup view (no server yet) ----
         self.setup = QWidget()
         sl = QVBoxLayout(self.setup)
         sl.setContentsMargins(0, 0, 0, 0)
-        sl.setSpacing(10)
-        info = QLabel("Friends need a small server (free).\n"
-                      "Easiest: run friends_server.py on any PC/host your friends can reach,\n"
-                      "then paste its address below, e.g. http://1.2.3.4:8080\n"
-                      "Or use a Firebase Realtime Database link.\n"
-                      "See FRIENDS_SETUP.txt. Everyone uses the same address.")
-        info.setWordWrap(True)
-        info.setStyleSheet("font-size:12px; color:rgba(255,255,255,170);")
-        self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("https://your-project-default-rtdb.firebaseio.com")
-        self.url_save = QPushButton("Connect")
-        self.url_save.setObjectName("act")
-        self.url_save.setCursor(Qt.PointingHandCursor)
-        self.url_save.setFocusPolicy(Qt.NoFocus)
-        self.url_save.clicked.connect(self.save_url)
-        sl.addWidget(info)
-        sl.addWidget(self.url_edit)
-        sl.addWidget(self.url_save)
+        sl.setSpacing(9)
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet("font-size:12px; color:rgba(255,255,255,170);")
+        self.username_edit = QLineEdit()
+        self.username_edit.setPlaceholderText("Username (3-24 English letters, numbers, _)")
+        self.email_edit = QLineEdit()
+        self.email_edit.setPlaceholderText("Email")
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.code_edit_auth = QLineEdit()
+        self.code_edit_auth.setPlaceholderText("6-digit code from your email")
+        self.code_edit_auth.setMaxLength(10)
+        self.connect_btn = QPushButton("Log in")
+        self.connect_btn.setObjectName("act")
+        self.connect_btn.setCursor(Qt.PointingHandCursor)
+        self.connect_btn.clicked.connect(self.submit)
+        self.google_btn = QPushButton("Continue with Google")
+        self.google_btn.setObjectName("act")
+        self.google_btn.setCursor(Qt.PointingHandCursor)
+        self.google_btn.setIcon(qta.icon("fa5b.google", color="white"))
+        self.google_btn.clicked.connect(self.run_google)
+        self.link1 = QPushButton("")
+        self.link2 = QPushButton("")
+        for link in (self.link1, self.link2):
+            link.setFlat(True)
+            link.setCursor(Qt.PointingHandCursor)
+            link.setFocusPolicy(Qt.NoFocus)
+            link.setStyleSheet("color:rgba(255,255,255,150); font-size:12px; border:none; padding:3px;")
+        for edit in (self.username_edit, self.email_edit, self.password_edit, self.code_edit_auth):
+            edit.returnPressed.connect(self.submit)
+        for w in (self.info, self.username_edit, self.email_edit, self.password_edit,
+                  self.code_edit_auth, self.connect_btn, self.google_btn, self.link1, self.link2):
+            sl.addWidget(w)
         sl.addStretch()
+        self.mode = "login"
+        self._kind = "signup"
+        self._ctx_pending = None
+        self._targets = [None, None]
+        self.link1.clicked.connect(lambda: self._targets[0] and self.link_action(self._targets[0]))
+        self.link2.clicked.connect(lambda: self._targets[1] and self.link_action(self._targets[1]))
         lay.addWidget(self.setup, 1)
 
-        # ---- main view ----
         self.main = QWidget()
         ml = QVBoxLayout(self.main)
         ml.setContentsMargins(0, 0, 0, 0)
-        ml.setSpacing(10)
-
+        ml.setSpacing(9)
         mine = QHBoxLayout()
-        cap = QLabel("Your code")
+        cap = QLabel("Your ID")
         cap.setStyleSheet("font-size:12px; color:rgba(255,255,255,140);")
         self.code_label = QLabel("")
-        self.code_label.setStyleSheet("font-size:20px; font-weight:bold; letter-spacing:3px;")
+        self.code_label.setStyleSheet("font-size:20px; font-weight:bold; letter-spacing:2px;")
         self.copy_btn = QPushButton("Copy")
         self.copy_btn.setObjectName("act")
-        self.copy_btn.setCursor(Qt.PointingHandCursor)
-        self.copy_btn.setFocusPolicy(Qt.NoFocus)
         self.copy_btn.clicked.connect(self.copy_code)
         mine.addWidget(cap)
-        mine.addSpacing(6)
         mine.addWidget(self.code_label)
         mine.addStretch()
         mine.addWidget(self.copy_btn)
         ml.addLayout(mine)
-
         add = QHBoxLayout()
         self.code_edit = QLineEdit()
-        self.code_edit.setMaxLength(6)
-        self.code_edit.setPlaceholderText("Friend's code")
+        self.code_edit.setPlaceholderText("Friend ID or exact username")
         self.code_edit.returnPressed.connect(self.add_friend)
         self.add_btn = QPushButton("Add")
         self.add_btn.setObjectName("act")
-        self.add_btn.setCursor(Qt.PointingHandCursor)
-        self.add_btn.setFocusPolicy(Qt.NoFocus)
         self.add_btn.clicked.connect(self.add_friend)
         add.addWidget(self.code_edit, 1)
         add.addWidget(self.add_btn)
         ml.addLayout(add)
-
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
@@ -3458,30 +4248,30 @@ class FriendsPanel(Popover):
         self.list_lay.setSpacing(6)
         self.scroll.setWidget(self.list_host)
         ml.addWidget(self.scroll, 1)
-
-        self.reset_link = QPushButton("Change server")
-        self.reset_link.setFlat(True)
-        self.reset_link.setCursor(Qt.PointingHandCursor)
-        self.reset_link.setFocusPolicy(Qt.NoFocus)
-        self.reset_link.setStyleSheet("color:rgba(255,255,255,90); font-size:10px; border:none;")
-        self.reset_link.clicked.connect(self.change_server)
-        ml.addWidget(self.reset_link, 0, Qt.AlignRight)
+        self.logout_btn = QPushButton("Log out")
+        self.logout_btn.setFlat(True)
+        self.logout_btn.setCursor(Qt.PointingHandCursor)
+        self.logout_btn.setStyleSheet("color:rgba(255,255,255,110); font-size:11px; border:none;")
+        self.logout_btn.clicked.connect(self.change_server)
+        ml.addWidget(self.logout_btn, 0, Qt.AlignRight)
         lay.addWidget(self.main, 1)
-
         self.service.changed.connect(self.rebuild)
+        self.username_edit.setText(win.config.get("friends_username", ""))
+        self.set_mode("login")
 
-    # ---- popover hooks ----
     def target_pos(self):
         o = self.owner.mapTo(self.win, QPoint(0, 0))
         return self.clamp(o.x() + self.owner.width() - self.width(), o.y() + self.owner.height() + 10)
+
+    def on_close(self):
+        self.friend_details.close_pop()
 
     def on_open(self):
         self.rebuild()
         self.service.refresh()
 
-    # ---- helpers ----
     def toast(self, text, anchor=None):
-        tip().flash(text, anchor or self.add_btn, "top", "", 2400)
+        tip().flash(str(text), anchor or self.add_btn, "top", "", 2800)
 
     def clear_rows(self):
         while self.list_lay.count():
@@ -3492,7 +4282,7 @@ class FriendsPanel(Popover):
                 widget.setParent(None)
                 widget.deleteLater()
 
-    def make_row(self, name, sub, online, buttons=(), code=None):
+    def make_row(self, name, sub, online, buttons=(), friend_id=None, extra=""):
         row = QWidget()
         row.setObjectName("row")
         row.setAttribute(Qt.WA_StyledBackground, True)
@@ -3500,9 +4290,13 @@ class FriendsPanel(Popover):
         hl = QHBoxLayout(row)
         hl.setContentsMargins(10, 8, 10, 8)
         hl.setSpacing(10)
-        pic = QLabel()
-        pic.setPixmap(avatar_pixmap(None, 34, name))
-        pic.setFixedSize(34, 34)
+        pic = QPushButton()
+        pic.setFixedSize(38, 38)
+        pic.setCursor(Qt.PointingHandCursor)
+        pic.setFocusPolicy(Qt.NoFocus)
+        pic.setIcon(QIcon(avatar_pixmap(None, 34, name)))
+        pic.setIconSize(QSize(34, 34))
+        pic.setStyleSheet("QPushButton{background:transparent;border:0;padding:0;} QPushButton:hover{background:rgba(255,255,255,12);border-radius:19px;}")
         hl.addWidget(pic)
         col = QVBoxLayout()
         col.setSpacing(0)
@@ -3512,12 +4306,16 @@ class FriendsPanel(Popover):
         bottom.setStyleSheet("font-size:11px; color:rgba(255,255,255,130);")
         col.addWidget(top)
         col.addWidget(bottom)
+        if extra:
+            more = QLabel(extra)
+            more.setWordWrap(True)
+            more.setStyleSheet("font-size:10px; color:rgba(255,255,255,100);")
+            col.addWidget(more)
         hl.addLayout(col, 1)
         if online is not None:
             dot = QLabel()
             dot.setFixedSize(10, 10)
-            dot.setStyleSheet("border-radius:5px; background:%s;" %
-                              ("rgb(84,196,140)" if online else "rgba(255,255,255,60)"))
+            dot.setStyleSheet("border-radius:5px; background:%s;" % ("rgb(84,196,140)" if online else "rgba(255,255,255,60)"))
             hl.addWidget(dot)
         for obj, icon, slot in buttons:
             b = QPushButton()
@@ -3528,80 +4326,300 @@ class FriendsPanel(Popover):
             b.setIcon(qta.icon(icon, color="white"))
             b.clicked.connect(lambda checked=False, s=slot: s())
             hl.addWidget(b)
-        if code:
+        if friend_id:
+            friend_data = next((f for f in self.service.friends if f.get("user_id") == friend_id), {})
+            pic.clicked.connect(lambda checked=False, f=dict(friend_data): self.friend_details.open_for(f))
+            top.mousePressEvent = lambda event, f=dict(friend_data): self.friend_details.open_for(f)
+            bottom.mousePressEvent = lambda event, f=dict(friend_data): self.friend_details.open_for(f)
+            top.setCursor(Qt.PointingHandCursor)
+            bottom.setCursor(Qt.PointingHandCursor)
             row.setContextMenuPolicy(Qt.CustomContextMenu)
-            row.customContextMenuRequested.connect(
-                lambda pos, r=row, c=code, n=name: self.friend_menu(r.mapToGlobal(pos), c, n))
+            row.customContextMenuRequested.connect(lambda pos, r=row, fid=friend_id, n=name: self.friend_menu(r.mapToGlobal(pos), fid, n))
         return row
 
-    def friend_menu(self, pos, code, name):
+    def friend_menu(self, pos, friend_id, name):
         menu = styled_menu(self)
-        menu.addAction(f"Remove {name}", lambda: self.service.act(
-            friends_remove, code, done=self.toast))
+        menu.addAction(f"Remove {name}", lambda: self.service.act(friends_remove, friend_id, done=self.toast))
         menu.exec(pos)
 
     def rebuild(self):
-        svc = self.service
-        configured = svc.configured
+        configured = self.service.configured
         self.setup.setVisible(not configured)
         self.main.setVisible(configured)
+        self.state.setText(self.service.error or ("Syncing..." if self.service.busy else ""))
         if not configured:
-            self.state.setText("")
             return
-        self.code_label.setText(svc.my_code())
-        self.state.setText(svc.error or ("syncing..." if svc.busy else ""))
+        self.code_label.setText(self.service.my_code())
         self.clear_rows()
-        for r in svc.requests:
-            self.list_lay.addWidget(self.make_row(
-                r["name"], "wants to be your friend", None,
-                [("ok", "fa5s.check", lambda c=r["code"]: svc.act(friends_accept, c, done=self.toast)),
-                 ("no", "fa5s.times", lambda c=r["code"]: svc.act(friends_decline, c, done=self.toast))]))
-        for f in svc.friends:
-            on = svc.online(f)
-            self.list_lay.addWidget(self.make_row(
-                f["name"], (f["status"] or ("online" if on else "offline")), on, code=f["code"]))
-        if not svc.requests and not svc.friends:
-            empty = QLabel("No friends yet.\nShare your code or add theirs.")
+        for r in self.service.requests:
+            self.list_lay.addWidget(self.make_row(r["name"], "wants to be your friend", None,
+                [("ok", "fa5s.check", lambda fid=r["user_id"]: self.service.act(friends_accept, fid, done=self.toast)),
+                 ("no", "fa5s.times", lambda fid=r["user_id"]: self.service.act(friends_decline, fid, done=self.toast))]))
+        for f in self.service.friends:
+            on = self.service.online(f)
+            self.list_lay.addWidget(self.make_row(f["name"], f.get("status") or ("online" if on else "offline"), on,
+                                                  friend_id=f["user_id"], extra=self.stats_line(f)))
+        if not self.service.requests and not self.service.friends:
+            empty = QLabel("No friends yet.\nShare your ID or add a friend.")
             empty.setAlignment(Qt.AlignCenter)
             empty.setStyleSheet("color:rgba(255,255,255,110); font-size:12px; padding:30px;")
             self.list_lay.addWidget(empty)
+        if _ACTIVITY["ok"] is False:
+            note = QLabel("Friend activity is off: run the activity part of SUPABASE_SETUP.sql")
+            note.setWordWrap(True)
+            note.setStyleSheet("color:rgba(255,255,255,80); font-size:10px;")
+            self.list_lay.addWidget(note)
         self.list_lay.addStretch()
+        self.friend_details.refresh_from(self.service.friends)
 
-    # ---- actions ----
-    def save_url(self):
-        url = normalize_db_url(self.url_edit.text())
-        if not url:
+    @staticmethod
+    def stats_line(friend):
+        """'Top today: Chrome 1h 35m  |  7 windows  |  3 focus' (only if the friend shares it today)."""
+        st = friend.get("stats")
+        if not isinstance(st, dict) or st.get("day") != time.strftime("%Y-%m-%d"):
+            return ""
+        parts = []
+        if st.get("top_app"):
+            parts.append(f"Top today: {st['top_app']} {fmt_minutes(st.get('top_min', 0))}")
+        if st.get("open_apps"):
+            parts.append(f"{st['open_apps']} windows open")
+        if st.get("focus"):
+            parts.append(f"{st['focus']} focus")
+        if st.get("total_min"):
+            parts.append(f"active {fmt_minutes(st['total_min'])}")
+        return "  |  ".join(parts)
+
+    def set_mode(self, mode):
+        self.mode = mode
+        cfg = {
+            "login":    ("Log in with your email and password.",
+                         {"email", "password"}, "Log in", "password",
+                         ("Create account", "register"), ("Forgot password?", "forgot")),
+            "register": ("Create an account. Your username is how friends find you.",
+                         {"username", "email", "password"}, "Create account", "password",
+                         ("I already have an account", "login"), None),
+            "code":     ("We sent a 6-digit code to your email. Enter it to confirm your account.",
+                         {"code"}, "Verify", None,
+                         ("Resend code", "resend"), ("Back", "login")),
+            "forgot":   ("Enter your email and we will send you a code.",
+                         {"email"}, "Send code", None,
+                         ("Back", "login"), None),
+            "reset":    ("Enter the code from your email and choose a new password.",
+                         {"code", "password"}, "Set new password", "new",
+                         ("Back", "login"), None),
+            "profile":  ("Choose a public username so friends can find you.",
+                         {"username"}, "Continue", None,
+                         ("Log out", "logout"), None),
+        }[mode]
+        text, shown, primary, pw_hint, l1, l2 = cfg
+        self.info.setText(text)
+        self.username_edit.setVisible("username" in shown)
+        self.email_edit.setVisible("email" in shown)
+        self.password_edit.setVisible("password" in shown)
+        self.code_edit_auth.setVisible("code" in shown)
+        self.password_edit.setPlaceholderText("New password (6+ characters)" if pw_hint == "new"
+                                              else "Password (6+ characters)")
+        self.connect_btn.setText(primary)
+        self.google_btn.setVisible(mode in ("login", "register"))
+        self._targets = [l1[1] if l1 else None, l2[1] if l2 else None]
+        for link, spec in ((self.link1, l1), (self.link2, l2)):
+            link.setVisible(spec is not None)
+            if spec:
+                link.setText(spec[0])
+
+    def link_action(self, target):
+        if target == "logout":
+            self.change_server()
+        elif target == "resend":
+            self.run_auth("resend")
+        else:
+            self.set_mode(target)
+
+    def submit(self):
+        mode = self.mode
+        email = self.email_edit.text().strip()
+        password = self.password_edit.text()
+        username = self.username_edit.text().strip()
+        code = self.code_edit_auth.text().strip()
+        if mode in ("login", "register", "forgot") and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            return self.toast("Enter a valid email", self.connect_btn)
+        if mode in ("login", "register", "reset") and len(password) < 6:
+            return self.toast("Password must be at least 6 characters", self.connect_btn)
+        if mode in ("register", "profile"):
+            if not re.fullmatch(r"[A-Za-z0-9_]{3,24}", username):
+                return self.toast("Username: 3-24 English letters, numbers or _", self.connect_btn)
+        if mode in ("code", "reset") and not code:
+            return self.toast("Enter the code from your email", self.connect_btn)
+        if mode == "profile":
+            return self.run_job_finish(username)
+        action = {"login": "login", "register": "signup", "forgot": "recover",
+                  "code": "verify", "reset": "reset"}[mode]
+        self.run_auth(action)
+
+    def run_auth(self, action):
+        email = self.email_edit.text().strip()
+        if not email:
+            return self.toast("Enter your email first", self.connect_btn)
+        self.begin_busy()
+        run_job(friends_auth, self.auth_done, SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, action, email,
+                self.password_edit.text(), self.username_edit.text().strip(),
+                self.code_edit_auth.text().strip(), self.win.profile_name())
+
+    def run_google(self):
+        self.connect_btn.setEnabled(False)
+        self.google_btn.setEnabled(False)
+        self.state.setText("Finish signing in in your browser...")
+        def done(result, error):
+            self.google_btn.setEnabled(True)
+            self.auth_done(result, error)
+        run_job(google_login, done, SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, self.win.profile_name())
+
+    def run_job_finish(self, username):
+        self.begin_busy()
+        run_job(friends_finish, self.auth_done, self._ctx_pending, username, self.win.profile_name())
+
+    def begin_busy(self):
+        self.connect_btn.setEnabled(False)
+        self.state.setText("Please wait...")
+
+    def auth_done(self, result, error):
+        self.connect_btn.setEnabled(True)
+        self.state.setText("")
+        if error is not None:
+            self.toast(str(error)[:180], self.connect_btn)
             return
-        self.win.config["friend_db_url"] = url
+        step = result.get("step")
+        if step == "code":
+            self._kind = result.get("kind", "signup")
+            self.code_edit_auth.clear()
+            self.set_mode("code" if self._kind == "signup" else "reset")
+            self.toast("Code sent. Check your email (and spam)", self.connect_btn)
+            return
+        if step == "profile":
+            self._ctx_pending = result["ctx"]
+            self.set_mode("profile")
+            if result.get("error"):
+                self.toast(result["error"], self.connect_btn)
+            return
+        ctx, cfg = result["ctx"], self.win.config
+        cfg["supabase_url"] = SUPABASE_URL
+        cfg["supabase_key"] = SUPABASE_PUBLISHABLE_KEY
+        cfg["supabase_access_token"] = ctx.get("access_token", "")
+        cfg["supabase_refresh_token"] = ctx.get("refresh_token", "")
+        cfg["supabase_user_id"] = ctx.get("user_id", "")
+        cfg["friend_code"] = result["friend_code"]
+        cfg["friends_username"] = result["username"]
         self.win.save_config()
+        for edit in (self.password_edit, self.code_edit_auth):
+            edit.clear()
+        self._ctx_pending = None
+        self.set_mode("login")
         self.service.start()
         self.rebuild()
+        self.toast("Connected! Your friend ID is ready", self.connect_btn)
 
     def change_server(self):
-        self.win.config["friend_db_url"] = ""
+        # Log out: forget this device's session. Your account and friends stay on the server.
+        cfg = self.win.config
+        for key in ("supabase_access_token", "supabase_refresh_token", "supabase_user_id", "friend_code"):
+            cfg[key] = ""
+        cfg["activity_published"] = False
         self.win.save_config()
+        self.password_edit.clear()
         self.service.friends, self.service.requests = [], []
-        self.service.start()
-        self.win.friends_btn.set_badge(0)
-        self.url_edit.setText("")
+        self.service.timer.stop()
+        self._ctx_pending = None
+        self.set_mode("login")
         self.rebuild()
 
     def copy_code(self):
         QApplication.clipboard().setText(self.service.my_code())
-        self.toast("Code copied", self.copy_btn)
+        self.toast("ID copied", self.copy_btn)
 
     def add_friend(self):
-        code = clean_code(self.code_edit.text())
-        if not code:
+        query = clean_friend_query(self.code_edit.text())
+        if not query:
             return
         self.code_edit.clear()
-        self.service.act(friends_add, self.win.profile_name(), code, done=self.toast)
+        self.service.act(friends_add, query, done=self.toast)
+
 
 
 # ----------------------------- Updates (GitHub) -----------------------------
 
 def parse_version(text):
     return tuple(int(x) for x in re.findall(r"\d+", str(text))[:4])
+
+
+def fetch_first_update_info(urls):
+    last = None
+    for url in urls:
+        if not url:
+            continue
+        try:
+            return fetch_update_info(url)
+        except Exception as exc:
+            last = exc
+    raise last or RuntimeError("no update link")
+
+
+def download_exe_update(info):
+    """Download the new .exe next to the current one and verify its checksum."""
+    url = info.get("exe_url")
+    if not url:
+        raise ValueError("version.json has no exe_url")
+    target = EXE_PATH.with_name(EXE_PATH.stem + ".new.exe")
+    req = urllib.request.Request(url, headers={"User-Agent": "GlassDesktop-updater"})
+    digest = hashlib.sha256()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(target, "wb") as out:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                out.write(chunk)
+        want = (info.get("exe_sha256") or "").lower().strip()
+        if not want:
+            raise ValueError("version.json has no exe_sha256 - update refused")
+        if digest.hexdigest() != want:
+            raise ValueError("Checksum mismatch - update refused")
+        if target.stat().st_size < 1_000_000:
+            raise ValueError("Downloaded file is too small")
+    except Exception:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise
+    return str(target)
+
+
+def launch_exe_swap(new_path):
+    """Start a tiny helper that waits until this .exe has closed, swaps in the new one and restarts."""
+    old = str(EXE_PATH)
+    bat = BASE / "update_swap.bat"
+    bat.write_text("\r\n".join([
+        "@echo off",
+        f'set "NEW={new_path}"',
+        f'set "OLD={old}"',
+        "set /a n=0",
+        ":retry",
+        "ping -n 2 127.0.0.1 >nul",
+        'copy /y "%OLD%" "%OLD%.bak" >nul 2>&1',
+        'move /y "%NEW%" "%OLD%" >nul 2>&1',
+        "if not errorlevel 1 goto done",
+        "set /a n+=1",
+        "if %n% lss 40 goto retry",
+        "exit /b 1",
+        ":done",
+        'start "" "%OLD%"',
+        'del "%~f0"',
+    ]) + "\r\n", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"       # the new copy must unpack itself, not reuse ours
+    subprocess.Popen(["cmd", "/c", str(bat)], env=env, close_fds=True,
+                     creationflags=0x08000000 | 0x00000008)      # no window, detached
 
 
 def fetch_update_info(url):
@@ -3679,13 +4697,32 @@ class UpdateService(QObject):
             else:
                 self.state, self.message = "uptodate", "You have the latest version"
             self.changed.emit()
-        run_job(fetch_update_info, done, self.url)
+        run_job(fetch_first_update_info, done, [self.url, UPDATE_FALLBACK_URL])
 
     def install(self):
         if self.state != "available" or not self.info:
             return
-        if FROZEN:                                    # an .exe can't replace itself
-            webbrowser.open(self.info.get("page") or self.info.get("url") or self.url)
+        if FROZEN:
+            if os.name != "nt" or not self.info.get("exe_url"):
+                webbrowser.open(self.info.get("page") or self.url)
+                return
+            self.state, self.message = "installing", "Downloading..."
+            self.changed.emit()
+
+            def exe_done(path, error):
+                if error is not None:
+                    self.state, self.message = "error", "Update failed: " + str(error)[:60]
+                    self.changed.emit()
+                    return
+                try:
+                    launch_exe_swap(path)
+                except Exception as exc:
+                    self.state, self.message = "error", "Could not start the update: " + str(exc)[:40]
+                    self.changed.emit()
+                    return
+                self.win.close()
+                QApplication.quit()
+            run_job(download_exe_update, exe_done, self.info)
             return
         self.state, self.message = "installing", "Downloading..."
         self.changed.emit()
@@ -4334,6 +5371,57 @@ class MainWindow(QWidget):
     def profile_name(self):
         return self.config.get("name") or NAME
 
+    # ---- activity (which app you use most) ----
+    def track_activity(self):
+        """Every few seconds: count the time of the app in front. Stored only on this PC
+        unless 'Share my activity with friends' is on."""
+        if os.name != "nt":
+            return
+        now = time.time()
+        elapsed = min(now - getattr(self, "_act_last", now), 30.0)
+        self._act_last = now
+        if elapsed <= 0 or idle_seconds() > 120:
+            return
+        app = foreground_app()
+        if app:
+            days = self.config.setdefault("usage_days", {})
+            today = days.setdefault(time.strftime("%Y-%m-%d"), {})
+            today[app] = today.get(app, 0.0) + elapsed
+            for old in sorted(days)[:-14]:                 # keep two weeks
+                days.pop(old, None)
+        self._act_ticks = getattr(self, "_act_ticks", 0) + 1
+        if self._act_ticks % 8 == 0:
+            self.save_config()
+
+    def activity_summary(self):
+        day = time.strftime("%Y-%m-%d")
+        apps = self.config.get("usage_days", {}).get(day, {})
+        ranked = sorted(apps.items(), key=lambda kv: -kv[1])
+        windows = len(self.running_panel.get_running_windows()) if os.name == "nt" else 0
+        week = {}
+        for offset in range(7):
+            key = time.strftime("%Y-%m-%d", time.localtime(time.time() - offset * 86400))
+            for name, sec in self.config.get("usage_days", {}).get(key, {}).items():
+                week[name] = week.get(name, 0.0) + sec
+        week_ranked = sorted(week.items(), key=lambda kv: -kv[1])
+        return {"day": day,
+                "week_total_min": int(sum(week.values()) // 60),
+                "week_top3": [[n, int(sec // 60)] for n, sec in week_ranked[:3]],
+                "top_app": ranked[0][0] if ranked else "",
+                "top_min": int(ranked[0][1] // 60) if ranked else 0,
+                "total_min": int(sum(apps.values()) // 60),
+                "top3": [[n, int(sec // 60)] for n, sec in ranked[:3]],
+                "open_apps": windows,
+                "focus": self.focus_today()}
+
+    def activity_payload(self):
+        return self.activity_summary() if self.config.get("share_activity") else None
+
+    def set_share_activity(self, on):
+        self.config["share_activity"] = bool(on)
+        self.save_config()
+        self.friends.refresh()
+
     def apply_profile(self):
         name = self.profile_name()
         self.chip.set_profile(name, self.config.get("avatar"), self.config.get("status", ""))
@@ -4709,6 +5797,9 @@ class MainWindow(QWidget):
         self.apply_taskbar()
         self.friends.start()
         self.updater.start()
+        self.activity_timer = QTimer(self)
+        self.activity_timer.timeout.connect(self.track_activity)
+        self.activity_timer.start(15000)
 
         if self.first_run:                      # first start (e.g. on a friend's PC): ask for the name
             self.save_config()
@@ -5031,7 +6122,27 @@ class MainWindow(QWidget):
 
 # ----------------------------- Start -----------------------------
 
+def seed_assets():
+    """.exe: copy the default wallpaper / character / fonts that are bundled inside it into the
+    data folder on first run (existing files, e.g. your own wallpapers, are never overwritten)."""
+    if not FROZEN:
+        return
+    src = Path(getattr(sys, "_MEIPASS", "")) / "assets"
+    if not src.is_dir():
+        return
+    for item in src.rglob("*"):
+        if item.is_file():
+            dest = ASSETS / item.relative_to(src)
+            if not dest.exists():
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(item, dest)
+                except OSError as exc:
+                    print("Could not copy default asset:", exc)
+
+
 def main():
+    seed_assets()
     for folder in (ASSETS / "cards", MUSIC_DIR):
         folder.mkdir(parents=True, exist_ok=True)
 
